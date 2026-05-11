@@ -16,7 +16,9 @@ import timeit
 import matplotlib.pyplot as plt
 
 from problem import get_problem
+from model import ParetoSetModel
 from pymoo.indicators.hv import HV
+from pymoo.indicators.igd import IGD
 
 # ------------------------------------------------------------------------------
 # Tunable hyper-parameters
@@ -26,22 +28,34 @@ from pymoo.indicators.hv import HV
 INS_LIST = ['f1']  # quick test
 
 # MCMC parameters
-N_PARTICLES = 20          # number of particles
-N_ITER = 200              # total MCMC iterations
+N_PARTICLES = 64          # number of particles
+N_ITER = 600              # total MCMC iterations
 BURN_IN_FRACTION = 0.5    # collect samples after this fraction of iterations
 
-# Step sizes (ε_x < ε_λ as per AGENT.md)
-EPS_X = 1e-3
-EPS_LAMBDA = 5e-3
+# PSL-STCH baseline parameters for comparison
+PSL_N_STEPS = 2000
+PSL_N_PREF_UPDATE = 10
+PSL_LR = 1e-3
+PSL_MU = 0.01
 
-# Annealing schedules
-MU_START = 0.01
-MU_END = 30.0
-T_START = 5.0
-T_END = 0.005
+# Step sizes (ε_x < ε_λ as per AGENT.md)
+EPS_X = 5e-3
+EPS_LAMBDA = 2e-3
+
+# Zero-temperature refinement approximates the posterior mode as T -> 0.
+REFINE_STEPS = 200
+REFINE_LR = 5e-3
+
+# Annealing schedules for the repo's STCH convention:
+# L_mu = mu * logsumexp(lambda * (f - z*) / mu), so smaller mu is sharper.
+MU_START = 0.20
+MU_END = 0.01
+T_START = 0.20
+T_END = 0.01
 
 # Dirichlet prior concentration for λ
-ALPHA = 2.0
+ALPHA = 1.0
+LAMBDA_EPS = 1e-3
 
 # Augmented Tchebycheff parameter (0.0 = disabled)
 RHO = 0.0
@@ -87,38 +101,163 @@ def project_simplex(v):
     return w
 
 
-def mu_schedule(t, n_iter, mu_start=MU_START, mu_end=MU_END):
-    """Annealing schedule for smoothing parameter mu.
+def make_simplex_interior(v, eps=LAMBDA_EPS):
+    """Move simplex vectors into the eps-interior to avoid corner degeneracy."""
+    v = np.asarray(v, dtype=np.float64)
+    if v.ndim == 1:
+        v = np.maximum(v, eps)
+        return v / np.sum(v)
 
-    Phase 1 (exploration, first half): mu small -> medium
-    Phase 2 (exploitation, second half): mu medium -> large
-    """
-    half = n_iter // 2
-    if half == 0:
-        return mu_end
-    if t <= half:
-        progress = t / half
-        return mu_start + (mu_end * 0.4 - mu_start) * progress
+    v = np.maximum(v, eps)
+    return v / np.sum(v, axis=1, keepdims=True)
+
+
+def das_dennis_recursion(ref_dirs, ref_dir, n_partitions, beta, depth):
+    if depth == len(ref_dir) - 1:
+        ref_dir[depth] = beta / (1.0 * n_partitions)
+        ref_dirs.append(ref_dir[None, :])
     else:
-        progress = (t - half) / half
-        return mu_end * 0.4 + (mu_end - mu_end * 0.4) * progress
+        for i in range(beta + 1):
+            ref_dir[depth] = 1.0 * i / (1.0 * n_partitions)
+            das_dennis_recursion(
+                ref_dirs, np.copy(ref_dir), n_partitions, beta - i, depth + 1
+            )
+
+
+def das_dennis(n_partitions, n_dim):
+    if n_partitions == 0:
+        return np.full((1, n_dim), 1 / n_dim)
+
+    ref_dirs = []
+    ref_dir = np.full(n_dim, np.nan)
+    das_dennis_recursion(ref_dirs, ref_dir, n_partitions, n_partitions, 0)
+    return np.concatenate(ref_dirs, axis=0)
+
+
+def get_eval_preferences(n_obj):
+    if n_obj == 2:
+        grid = np.linspace(0, 1, 200)
+        return np.stack([grid, 1 - grid], axis=1)
+    if n_obj == 3:
+        return das_dennis(44, 3)
+    raise ValueError(f"No preference grid configured for {n_obj} objectives.")
+
+
+def get_stratified_preferences(n_points, n_obj):
+    """Deterministic simplex coverage for preference particles."""
+    if n_obj == 2:
+        grid = np.linspace(0, 1, n_points)
+        return make_simplex_interior(np.stack([grid, 1 - grid], axis=1))
+
+    if n_obj == 3:
+        n_partitions = 1
+        while (n_partitions + 1) * (n_partitions + 2) // 2 < n_points:
+            n_partitions += 1
+        refs = das_dennis(n_partitions, n_obj)
+        if len(refs) == n_points:
+            return make_simplex_interior(refs)
+        idx = np.linspace(0, len(refs) - 1, n_points).round().astype(int)
+        return make_simplex_interior(refs[idx])
+
+    return make_simplex_interior(np.random.dirichlet(np.ones(n_obj), n_points))
+
+
+def get_reference_front(test_ins, n_obj, ideal_point, nadir_point, n_points=1000):
+    """Return a normalized reference Pareto front for IGD."""
+    if test_ins in ['f1', 'f2', 'f3']:
+        x = np.linspace(0, 1, n_points)
+        return np.stack([x, 1 - np.sqrt(x)], axis=1)
+
+    if test_ins in ['f4', 'f5', 'f6']:
+        x = np.linspace(0, 1, n_points)
+        return np.stack([x, 1 - x ** 2], axis=1)
+
+    if test_ins.startswith('re'):
+        base = os.path.dirname(os.path.abspath(__file__))
+        pf_path = os.path.join(base, f'data/RE/ParetoFront/{test_ins}.dat')
+        if os.path.exists(pf_path):
+            pf = np.loadtxt(pf_path)
+            pf = np.atleast_2d(pf)
+            return (pf - ideal_point) / (nadir_point - ideal_point)
+
+    return None
+
+
+def nondominated_mask(F):
+    """Return a boolean mask for non-dominated minimization objective vectors."""
+    if F is None or len(F) == 0:
+        return np.array([], dtype=bool)
+
+    is_nd = np.ones(F.shape[0], dtype=bool)
+    for i in range(F.shape[0]):
+        if not is_nd[i]:
+            continue
+        better = np.all(F <= F[i], axis=1) & np.any(F < F[i], axis=1)
+        if np.any(better):
+            is_nd[i] = False
+    return is_nd
+
+
+def filter_nondominated(F):
+    """Extract a non-dominated front from minimization objective vectors."""
+    if F is None or len(F) == 0:
+        return np.empty((0, 0))
+    return F[nondominated_mask(F)]
+
+
+def diversity(front):
+    """Average pairwise Euclidean distance on a front."""
+    if front is None or len(front) <= 1:
+        return 0.0
+
+    if len(front) > 500:
+        idx = np.random.choice(len(front), 500, replace=False)
+        front = front[idx]
+
+    dists = []
+    for i in range(len(front)):
+        for j in range(i + 1, len(front)):
+            dists.append(np.linalg.norm(front[i] - front[j]))
+    return float(np.mean(dists)) if dists else 0.0
+
+
+def compute_front_metrics(F, n_obj, ref_point=None, reference_pf=None):
+    """Compute HV, IGD, and diversity from normalized objective vectors."""
+    if F is None or len(F) == 0:
+        return {'hypervolume': np.nan, 'igd': np.nan, 'diversity': 0.0}, F
+
+    if ref_point is None:
+        ref_point = np.array([1.1] * n_obj)
+
+    pf = filter_nondominated(F)
+    metrics = {
+        'hypervolume': np.nan,
+        'igd': np.nan,
+        'diversity': diversity(pf),
+    }
+
+    if len(pf) > 0:
+        metrics['hypervolume'] = float(HV(ref_point=ref_point)(pf))
+        if reference_pf is not None and len(reference_pf) > 0:
+            metrics['igd'] = float(IGD(reference_pf)(pf))
+
+    return metrics, pf
+
+
+def mu_schedule(t, n_iter, mu_start=MU_START, mu_end=MU_END):
+    """Anneal from smooth weighted-sum-like STCH to sharper Tchebycheff."""
+    if n_iter <= 1:
+        return mu_end
+    progress = (t - 1) / (n_iter - 1)
+    return mu_start * (mu_end / mu_start) ** progress
 
 
 def T_schedule(t, n_iter, T_start=T_START, T_end=T_END):
-    """Annealing schedule for temperature T.
-
-    Phase 1 (exploration): T large -> medium
-    Phase 2 (exploitation): T medium -> small
-    """
-    half = n_iter // 2
-    if half == 0:
+    """Geometric temperature annealing for Langevin exploration to exploitation."""
+    if n_iter <= 1:
         return T_end
-    if t <= half:
-        progress = t / half
-        return T_start + (T_end * 20 - T_start) * progress
-    else:
-        progress = (t - half) / half
-        return T_end * 20 + (T_end - T_end * 20) * progress
+    progress = (t - 1) / (n_iter - 1)
+    return T_start * (T_end / T_start) ** progress
 
 
 # ------------------------------------------------------------------------------
@@ -150,6 +289,7 @@ class SmoothTchMCMC:
         self.device = device
         self.rho = rho
         self.normalize = normalize
+        self.fixed_utopia = normalize and ideal_point is not None
 
         self.n_dim = problem.n_dim
         self.n_obj = problem.n_obj
@@ -173,20 +313,26 @@ class SmoothTchMCMC:
         # Initialize particles in [0, 1] (same convention as ParetoSetModel)
         self.X = torch.rand(N, self.n_dim, device=device, dtype=torch.float64)
 
-        # Initialize preferences uniformly on simplex
-        lam = np.zeros((N, self.n_obj))
-        for i in range(N):
-            lam[i] = np.random.dirichlet(np.ones(self.n_obj))
+        # Stratified simplex initialization improves preference-space coverage.
+        lam = get_stratified_preferences(N, self.n_obj)
         self.Lambda = torch.tensor(lam, device=device, dtype=torch.float64)
 
-        # Utopia point z* (best known value per objective)
-        self.z_star = torch.full(
-            (self.n_obj,), float('inf'), device=device, dtype=torch.float64)
+        # Utopia point z*. With known ideal/nadir normalization, the normalized
+        # utopia is exactly zero; otherwise estimate it online from particles.
+        if self.fixed_utopia:
+            self.z_star = torch.zeros(self.n_obj, device=device, dtype=torch.float64)
+        else:
+            self.z_star = torch.full(
+                (self.n_obj,), float('inf'), device=device, dtype=torch.float64)
 
         # Storage for post-burn-in samples
         self.samples_X = []
         self.samples_Lambda = []
         self.samples_F = []
+
+        # Optimizer-style output: best non-dominated points visited by the chain.
+        self.archive_X = None
+        self.archive_F = None
 
     def normalize_values(self, f_vals):
         """Normalize objective values using ideal / nadir points."""
@@ -205,6 +351,28 @@ class SmoothTchMCMC:
         """
         f_vals = self.problem.evaluate(X)  # (M, n_obj)
         return self.normalize_values(f_vals)
+
+    def update_archive(self, X, F):
+        """Keep the non-dominated archive of all visited particles."""
+        X_np = X.detach().cpu().numpy()
+        F_np = F.detach().cpu().numpy()
+        finite_mask = np.isfinite(F_np).all(axis=1)
+        if not np.any(finite_mask):
+            return
+
+        X_np = X_np[finite_mask]
+        F_np = F_np[finite_mask]
+
+        if self.archive_F is None:
+            merged_X = X_np
+            merged_F = F_np
+        else:
+            merged_X = np.concatenate([self.archive_X, X_np], axis=0)
+            merged_F = np.concatenate([self.archive_F, F_np], axis=0)
+
+        keep = nondominated_mask(merged_F)
+        self.archive_X = merged_X[keep]
+        self.archive_F = merged_F[keep]
 
     def step(self, t):
         """Perform one MCMC iteration."""
@@ -228,9 +396,10 @@ class SmoothTchMCMC:
             with torch.no_grad():
                 f_vals = self.evaluate_objectives(self.X)
 
-        min_vals = f_vals.min(dim=0)[0]
-        if torch.isfinite(min_vals).all():
-            self.z_star = torch.minimum(self.z_star, min_vals)
+        if not self.fixed_utopia:
+            min_vals = f_vals.min(dim=0)[0]
+            if torch.isfinite(min_vals).all():
+                self.z_star = torch.minimum(self.z_star, min_vals)
 
         # ----------------------------------------------------------
         # 2. Update each particle
@@ -247,8 +416,8 @@ class SmoothTchMCMC:
             ).requires_grad_(True)
             f_i_grad = self.evaluate_objectives(x_i)[0]  # (K,)
 
-            # Adaptive weights: w_k = softmax_k(mu * lambda_k * (f_k - z_k))
-            a = mu * lam_i * (f_i_grad - z)
+            # Adaptive weights for L_mu = mu * logsumexp(lambda * (f - z) / mu).
+            a = lam_i * (f_i_grad - z) / mu
             w = torch.softmax(a, dim=0).detach()
 
             # Scalar whose gradient gives the score direction
@@ -256,57 +425,98 @@ class SmoothTchMCMC:
             # grad_x L_aug    = rho * sum_k lambda_k * grad_x f_k
             scalar = torch.sum((w + self.rho) * lam_i * f_i_grad)
 
-            score_x = -(1.0 / T) * torch.autograd.grad(
+            grad_x_energy = torch.autograd.grad(
                 scalar, x_i, create_graph=False
             )[0][0]
 
             # Gradient clipping & NaN guard
-            score_x = torch.where(
-                torch.isfinite(score_x),
-                torch.clamp(score_x, -GRAD_CLIP, GRAD_CLIP),
-                torch.zeros_like(score_x)
+            grad_x_energy = torch.where(
+                torch.isfinite(grad_x_energy),
+                torch.clamp(grad_x_energy, -GRAD_CLIP, GRAD_CLIP),
+                torch.zeros_like(grad_x_energy)
             )
 
-            # Langevin update
+            # Temperature-consistent Langevin update for pi_T(x) proportional
+            # to exp(-U(x) / T): drift follows -grad U and noise scales as sqrt(T).
             noise_x = torch.randn(
                 self.n_dim, device=self.device, dtype=torch.float64)
             self.X[i] = (
                 self.X[i]
-                + (self.eps_x / 2.0) * score_x
-                + np.sqrt(self.eps_x) * noise_x
+                - self.eps_x * grad_x_energy
+                + np.sqrt(2.0 * self.eps_x * T) * noise_x
             )
             # Clip to feasible box [0, 1] (same convention as PSL)
             self.X[i] = torch.clamp(self.X[i], 0.0, 1.0)
 
             # --- λ-update via Projected Langevin on simplex -------
-            # score_lambda = -(1/T) * (w + rho) * (f - z) + (alpha-1)/lambda
-            score_lambda = -(1.0 / T) * (w + self.rho) * (f_i - z)
+            # Same temperature-consistent update on the preference simplex.
+            delta_i = f_i_grad.detach() - z
+            grad_lambda_energy = (w + self.rho) * delta_i
+            prior_drift = torch.zeros_like(lam_i)
             if self.alpha != 1.0:
-                score_lambda = score_lambda + (self.alpha - 1.0) / (lam_i + 1e-20)
+                prior_drift = (self.alpha - 1.0) / (lam_i + 1e-20)
 
             noise_lambda = torch.randn(
                 self.n_obj, device=self.device, dtype=torch.float64)
             lam_proposal = (
                 lam_i
-                + (self.eps_lambda / 2.0) * score_lambda
-                + np.sqrt(self.eps_lambda) * noise_lambda
+                - self.eps_lambda * grad_lambda_energy
+                + self.eps_lambda * T * prior_drift
+                + np.sqrt(2.0 * self.eps_lambda * T) * noise_lambda
             )
 
             # Project back to simplex
             self.Lambda[i] = torch.tensor(
-                project_simplex(lam_proposal.cpu().numpy()),
+                make_simplex_interior(project_simplex(lam_proposal.cpu().numpy())),
                 device=self.device, dtype=torch.float64
             )
 
+        with torch.no_grad():
+            current_f_vals = self.evaluate_objectives(self.X)
+        self.update_archive(self.X, current_f_vals)
+
         # ----------------------------------------------------------
-        # 3. Collect samples after burn-in
+        # 3. Collect posterior samples after burn-in
         # ----------------------------------------------------------
         if t >= self.burn_in_start:
             self.samples_X.append(self.X.cpu().clone().numpy())
             self.samples_Lambda.append(self.Lambda.cpu().clone().numpy())
-            self.samples_F.append(f_vals.cpu().clone().numpy())
+            self.samples_F.append(current_f_vals.cpu().clone().numpy())
 
         return mu, T
+
+    def refine_particles(self, n_steps=REFINE_STEPS, lr=REFINE_LR):
+        """Zero-temperature STCH refinement of final particles.
+
+        This is the deterministic limit of annealed Langevin dynamics and is
+        used only to improve the optimizer archive, not posterior uncertainty.
+        """
+        if n_steps <= 0:
+            return
+
+        x_param = self.X.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([x_param], lr=lr)
+        mu = self.mu_end
+        z = self.z_star.detach()
+        lam = self.Lambda.detach()
+
+        for _ in range(n_steps):
+            optimizer.zero_grad()
+            x_clamped = torch.clamp(x_param, 1e-6, 1.0 - 1e-6)
+            f_vals = self.evaluate_objectives(x_clamped)
+            delta = f_vals - z
+            smooth = mu * torch.logsumexp(lam * delta / mu, dim=1)
+            augmented = self.rho * torch.sum(lam * delta, dim=1)
+            loss = torch.sum(smooth + augmented)
+            loss.backward()
+            optimizer.step()
+            with torch.no_grad():
+                x_param.clamp_(0.0, 1.0)
+
+        self.X = x_param.detach()
+        with torch.no_grad():
+            refined_f_vals = self.evaluate_objectives(self.X)
+        self.update_archive(self.X, refined_f_vals)
 
     def run(self):
         """Run the full MCMC chain."""
@@ -317,6 +527,7 @@ class SmoothTchMCMC:
                     self.z_star.cpu().numpy(), precision=4, suppress_small=True)
                 print(f"  Iter {t:5d}/{self.n_iter} | mu={mu:.4f} | "
                       f"T={T:.6f} | z*={z_str}")
+        self.refine_particles()
         print("  Sampling complete.")
 
     def get_collected_samples(self):
@@ -328,67 +539,85 @@ class SmoothTchMCMC:
         F_all = np.concatenate(self.samples_F, axis=0)
         return X_all, Lambda_all, F_all
 
-    def compute_metrics(self, ref_point=None):
+    def compute_metrics(self, ref_point=None, reference_pf=None, use_archive=True):
         """Compute evaluation metrics on collected samples.
 
         Returns:
-            metrics: dict with hypervolume, diversity, uncertainty.
+            metrics: dict with hypervolume, IGD, diversity, uncertainty.
             pf: non-dominated objective vectors (M, n_obj).
         """
         X_all, Lambda_all, F_all = self.get_collected_samples()
         if F_all is None:
             return {}, None
 
-        # Subsample if too many points for expensive dominance check
-        M = F_all.shape[0]
+        metric_F = self.archive_F if use_archive and self.archive_F is not None else F_all
+
+        # Subsample if too many points for expensive dominance check.
+        M = metric_F.shape[0]
         if M > 5000:
             idx = np.random.choice(M, 5000, replace=False)
-            F_sub = F_all[idx]
+            F_sub = metric_F[idx]
         else:
-            F_sub = F_all
+            F_sub = metric_F
 
-        # Extract non-dominated front (naive O(M^2) — fine for M <= 5000)
-        is_nd = np.ones(F_sub.shape[0], dtype=bool)
-        for i in range(F_sub.shape[0]):
-            if not is_nd[i]:
-                continue
-            better = np.all(F_sub <= F_sub[i], axis=1) & np.any(F_sub < F_sub[i], axis=1)
-            if np.any(better):
-                is_nd[i] = False
-        pf = F_sub[is_nd]
-
-        metrics = {}
-
-        # Hypervolume
         if ref_point is None:
             if self.normalize:
                 ref_point = np.array([1.1] * self.n_obj)
             else:
                 ref_point = np.max(F_all, axis=0) + 0.1
-        if len(pf) > 0:
-            hv = HV(ref_point=ref_point)
-            metrics['hypervolume'] = float(hv(pf))
 
-        # Diversity: average pairwise Euclidean distance on Pareto front
-        if len(pf) > 1:
-            # Sample at most 500 points for diversity to keep it fast
-            if len(pf) > 500:
-                idx = np.random.choice(len(pf), 500, replace=False)
-                pf_div = pf[idx]
-            else:
-                pf_div = pf
-            dists = []
-            for i in range(len(pf_div)):
-                for j in range(i + 1, len(pf_div)):
-                    dists.append(np.linalg.norm(pf_div[i] - pf_div[j]))
-            metrics['diversity'] = float(np.mean(dists))
-        else:
-            metrics['diversity'] = 0.0
+        metrics, pf = compute_front_metrics(
+            F_sub, self.n_obj, ref_point=ref_point, reference_pf=reference_pf
+        )
 
         # Uncertainty per objective (std across all collected samples)
         metrics['uncertainty'] = np.std(F_all, axis=0).tolist()
+        metrics['archive_size'] = 0 if self.archive_F is None else len(self.archive_F)
 
         return metrics, pf
+
+
+# ------------------------------------------------------------------------------
+# PSL-STCH baseline
+# ------------------------------------------------------------------------------
+
+
+def run_psl_stch(problem, n_steps, n_pref_update, ideal_point, nadir_point, device='cpu'):
+    """Run the original Pareto Set Learning STCH baseline."""
+    psmodel = ParetoSetModel(problem.n_dim, problem.n_obj).to(device)
+    optimizer = torch.optim.Adam(psmodel.parameters(), lr=PSL_LR)
+
+    ideal = torch.tensor(ideal_point, device=device, dtype=torch.float64)
+    nadir = torch.tensor(nadir_point, device=device, dtype=torch.float64)
+    z = torch.zeros(problem.n_obj, device=device, dtype=torch.float64)
+
+    for _ in range(n_steps):
+        psmodel.train()
+
+        pref = np.random.dirichlet(np.ones(problem.n_obj), n_pref_update)
+        pref_vec = torch.tensor(pref, device=device, dtype=torch.float32)
+
+        x = psmodel(pref_vec)
+        value = problem.evaluate(x)
+        value = (value - ideal) / (nadir - ideal)
+
+        stch_value = PSL_MU * torch.logsumexp(pref_vec * (value - z) / PSL_MU, dim=1)
+        loss = torch.sum(stch_value)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        psmodel.eval()
+        pref = torch.tensor(
+            get_eval_preferences(problem.n_obj), device=device, dtype=torch.float32
+        )
+        sol = psmodel(pref)
+        obj = problem.evaluate(sol)
+        obj_norm = (obj - ideal) / (nadir - ideal)
+
+    return sol.cpu().numpy(), obj_norm.cpu().numpy()
 
 
 # ------------------------------------------------------------------------------
@@ -440,6 +669,94 @@ def plot_3d_pf(pf, test_ins, save_path=None):
     plt.close()
 
 
+def _metric_text(value):
+    if value is None or not np.isfinite(value):
+        return 'n/a'
+    return f'{value:.4f}'
+
+
+def save_figure(fig, save_path):
+    """Save a figure, avoiding crashes when an old plot file is locked."""
+    try:
+        fig.savefig(save_path, dpi=200, bbox_inches='tight')
+        return save_path
+    except PermissionError:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fallback_dir = os.path.join(repo_root, 'comparison_plots')
+        os.makedirs(fallback_dir, exist_ok=True)
+        root, ext = os.path.splitext(os.path.basename(save_path))
+        fallback = os.path.join(
+            fallback_dir, f'{root}_{int(timeit.default_timer() * 1000)}{ext}'
+        )
+        fig.savefig(fallback, dpi=200, bbox_inches='tight')
+        return fallback
+
+
+def plot_comparison_pf(mcmc_pf, psl_pf, reference_pf, metrics_by_method,
+                       test_ins, n_obj, save_path=None):
+    fig = plt.figure(figsize=(11, 5))
+
+    if n_obj == 3:
+        ax = fig.add_subplot(121, projection='3d')
+        if reference_pf is not None:
+            ax.scatter(reference_pf[:, 0], reference_pf[:, 1], reference_pf[:, 2],
+                       c='0.65', s=10, alpha=0.25, label='Reference')
+        if mcmc_pf is not None and len(mcmc_pf) > 0:
+            ax.scatter(mcmc_pf[:, 0], mcmc_pf[:, 1], mcmc_pf[:, 2],
+                       c='tomato', s=28, alpha=0.75, label='STCH-MCMC')
+        if psl_pf is not None and len(psl_pf) > 0:
+            ax.scatter(psl_pf[:, 0], psl_pf[:, 1], psl_pf[:, 2],
+                       c='royalblue', s=28, alpha=0.75, label='STCH-PSL')
+        ax.set_xlabel(r'$f_1(x)$', size=12)
+        ax.set_ylabel(r'$f_2(x)$', size=12)
+        ax.set_zlabel(r'$f_3(x)$', size=12)
+    else:
+        ax = fig.add_subplot(121)
+        if reference_pf is not None:
+            ax.plot(reference_pf[:, 0], reference_pf[:, 1],
+                    c='0.45', lw=1.5, alpha=0.7, label='Reference')
+        if mcmc_pf is not None and len(mcmc_pf) > 0:
+            ax.scatter(mcmc_pf[:, 0], mcmc_pf[:, 1],
+                       c='tomato', alpha=0.7, s=24, label='STCH-MCMC')
+        if psl_pf is not None and len(psl_pf) > 0:
+            ax.scatter(psl_pf[:, 0], psl_pf[:, 1],
+                       c='royalblue', alpha=0.7, s=24, label='STCH-PSL')
+        ax.set_xlabel(r'$f_1(x)$', size=16)
+        ax.set_ylabel(r'$f_2(x)$', size=16)
+        ax.grid(alpha=0.35)
+
+    ax.set_title(f'{test_ins} Pareto fronts')
+    ax.legend(fontsize=11)
+
+    table_ax = fig.add_subplot(122)
+    table_ax.axis('off')
+    rows = []
+    for method, metrics in metrics_by_method.items():
+        rows.append([
+            method,
+            _metric_text(metrics.get('hypervolume')),
+            _metric_text(metrics.get('igd')),
+            _metric_text(metrics.get('diversity')),
+        ])
+    table = table_ax.table(
+        cellText=rows,
+        colLabels=['Method', 'HV', 'IGD', 'Diversity'],
+        cellLoc='center',
+        loc='center',
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1.1, 1.6)
+    table_ax.set_title('Metrics', pad=12)
+
+    fig.tight_layout()
+    saved_path = None
+    if save_path:
+        saved_path = save_figure(fig, save_path)
+    plt.close(fig)
+    return saved_path
+
+
 # ------------------------------------------------------------------------------
 # Main execution loop
 # ------------------------------------------------------------------------------
@@ -468,7 +785,10 @@ if __name__ == '__main__':
             ideal = np.zeros(n_obj)
             nadir = np.ones(n_obj)
 
-        # Build and run sampler
+        reference_pf = get_reference_front(test_ins, n_obj, ideal, nadir)
+        ref_point = np.array([1.1] * n_obj)
+
+        # Build and run MCMC sampler
         sampler = SmoothTchMCMC(
             problem=problem,
             N=N_PARTICLES,
@@ -491,26 +811,57 @@ if __name__ == '__main__':
         sampler.run()
         stop = timeit.default_timer()
 
-        # Metrics
-        metrics, pf = sampler.compute_metrics()
-        print(f"\n  Time: {stop - start:.2f}s")
-        for k, v in metrics.items():
-            if k == 'uncertainty':
-                print(f"  {k:15s}: {np.array(v)}")
-            else:
-                print(f"  {k:15s}: {v:.6f}")
+        mcmc_metrics, mcmc_pf = sampler.compute_metrics(
+            ref_point=ref_point, reference_pf=reference_pf
+        )
+        print(f"\n  STCH-MCMC time: {stop - start:.2f}s")
 
-        # Plotting
-        if pf is not None and len(pf) > 0:
-            save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plots')
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f'{test_ins}_mcmc.png')
+        # Run original PSL-STCH baseline in the same execution
+        start = timeit.default_timer()
+        _, psl_F = run_psl_stch(
+            problem=problem,
+            n_steps=PSL_N_STEPS,
+            n_pref_update=PSL_N_PREF_UPDATE,
+            ideal_point=ideal,
+            nadir_point=nadir,
+            device=device,
+        )
+        stop = timeit.default_timer()
+        psl_metrics, psl_pf = compute_front_metrics(
+            psl_F, n_obj, ref_point=ref_point, reference_pf=reference_pf
+        )
+        print(f"  STCH-PSL  time: {stop - start:.2f}s")
 
-            if n_obj == 2:
-                plot_2d_pf(pf, test_ins, save_path=save_path)
-            elif n_obj == 3:
-                plot_3d_pf(pf, test_ins, save_path=save_path)
+        metrics_by_method = {
+            'STCH-MCMC': mcmc_metrics,
+            'STCH-PSL': psl_metrics,
+        }
 
-            print(f"  Plot saved to: {save_path}")
+        print("\n  Comparison metrics")
+        print("  Method        HV        IGD       Diversity")
+        for method_name, metrics in metrics_by_method.items():
+            print(
+                f"  {method_name:10s}  "
+                f"{_metric_text(metrics.get('hypervolume')):>8s}  "
+                f"{_metric_text(metrics.get('igd')):>8s}  "
+                f"{_metric_text(metrics.get('diversity')):>9s}"
+            )
+        print(f"  STCH-MCMC uncertainty: {np.array(mcmc_metrics['uncertainty'])}")
+        print(f"  STCH-MCMC archive size: {mcmc_metrics['archive_size']}")
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        save_dir = os.path.join(repo_root, 'comparison_plots')
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f'{test_ins}_comparison.png')
+        saved_path = plot_comparison_pf(
+            mcmc_pf=mcmc_pf,
+            psl_pf=psl_pf,
+            reference_pf=reference_pf,
+            metrics_by_method=metrics_by_method,
+            test_ins=test_ins,
+            n_obj=n_obj,
+            save_path=save_path,
+        )
+        print(f"  Comparison plot saved to: {saved_path}")
 
         print("\n" + "*" * 70)
