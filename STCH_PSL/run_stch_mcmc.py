@@ -693,7 +693,8 @@ def save_figure(fig, save_path):
 
 
 def plot_comparison_pf(mcmc_pf, psl_pf, reference_pf, metrics_by_method,
-                       test_ins, n_obj, save_path=None):
+                       test_ins, n_obj, save_path=None,
+                       mcmc_label='STCH-MCMC', psl_label='STCH-PSL'):
     fig = plt.figure(figsize=(11, 5))
 
     if n_obj == 3:
@@ -703,10 +704,10 @@ def plot_comparison_pf(mcmc_pf, psl_pf, reference_pf, metrics_by_method,
                        c='0.65', s=10, alpha=0.25, label='Reference')
         if mcmc_pf is not None and len(mcmc_pf) > 0:
             ax.scatter(mcmc_pf[:, 0], mcmc_pf[:, 1], mcmc_pf[:, 2],
-                       c='tomato', s=28, alpha=0.75, label='STCH-MCMC')
+                       c='tomato', s=28, alpha=0.75, label=mcmc_label)
         if psl_pf is not None and len(psl_pf) > 0:
             ax.scatter(psl_pf[:, 0], psl_pf[:, 1], psl_pf[:, 2],
-                       c='royalblue', s=28, alpha=0.75, label='STCH-PSL')
+                       c='royalblue', s=28, alpha=0.75, label=psl_label)
         ax.set_xlabel(r'$f_1(x)$', size=12)
         ax.set_ylabel(r'$f_2(x)$', size=12)
         ax.set_zlabel(r'$f_3(x)$', size=12)
@@ -717,10 +718,10 @@ def plot_comparison_pf(mcmc_pf, psl_pf, reference_pf, metrics_by_method,
                     c='0.45', lw=1.5, alpha=0.7, label='Reference')
         if mcmc_pf is not None and len(mcmc_pf) > 0:
             ax.scatter(mcmc_pf[:, 0], mcmc_pf[:, 1],
-                       c='tomato', alpha=0.7, s=24, label='STCH-MCMC')
+                       c='tomato', alpha=0.7, s=24, label=mcmc_label)
         if psl_pf is not None and len(psl_pf) > 0:
             ax.scatter(psl_pf[:, 0], psl_pf[:, 1],
-                       c='royalblue', alpha=0.7, s=24, label='STCH-PSL')
+                       c='royalblue', alpha=0.7, s=24, label=psl_label)
         ax.set_xlabel(r'$f_1(x)$', size=16)
         ax.set_ylabel(r'$f_2(x)$', size=16)
         ax.grid(alpha=0.35)
